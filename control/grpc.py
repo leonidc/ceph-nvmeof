@@ -3303,9 +3303,23 @@ class GatewayService(pb2_grpc.GatewayServicer):
     def set_ana_state_safe(self, ana_info: pb2.ana_info, context=None):
         peer_msg = self.get_peer_message(context)
         """Sets ana state for this gateway."""
-        self.logger.info(f"Received request to set ana states {ana_info.states}, {peer_msg}")
+        self.logger.info(f"Received request to set ana states {ana_info.states}, {peer_msg},"
+                         f" hold_ios: {ana_info.hold_ios}")
 
         assert self.rpc_lock.locked(), "RPC is unlocked when calling set_ana_state_safe()"
+        if ana_info.hold_ios:
+            try:
+                self.logger.debug("send RPC to SPDK to transiently hold all IOs")
+                self.spdk_rpc_client.nvmf_set_transient_hold(enable=True)
+                return pb2.req_status(status=True)
+
+            except Exception as ex:
+                self.logger.exception("nvmf_set_transient_hold")
+                if context:
+                    context.set_code(grpc.StatusCode.INTERNAL)
+                    context.set_details(f"{ex}")
+                    return pb2.req_status()
+
         inaccessible_ana_groups = {}
         awaited_cluster_contexts = set()
         # Iterate over nqn_ana_states in ana_info
@@ -3335,12 +3349,16 @@ class GatewayService(pb2_grpc.GatewayServicer):
                     if gs.state == pb2.ana_state.OPTIMIZED:
                         ana_state = "optimized"
                     else:
-                        ana_state = "inaccessible"
+                        if gs.state == pb2.ana_state.NON_OPTIMIZED:
+                            ana_state = "non_optimized"
+                        else:
+                            ana_state = "inaccessible"
                     try:
                         # Need to wait for the latest OSD map, for each RADOS
                         # cluster context before becoming optimized,
                         # part of blocklist logic
-                        if gs.state == pb2.ana_state.OPTIMIZED:
+                        if gs.state == pb2.ana_state.NON_OPTIMIZED or \
+                           gs.state == pb2.ana_state.OPTIMIZED:
                             # Go over the namespaces belonging to the ana group
                             ns = self.subsystem_nsid_bdev_and_uuid.get_namespace_infos_for_anagrpid(
                                 nqn, grp_id)
